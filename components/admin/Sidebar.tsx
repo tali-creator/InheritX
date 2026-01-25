@@ -17,10 +17,10 @@ import { motion } from "framer-motion";
 
 const navItems = [
     { name: "Dashboard", icon: LayoutDashboard, href: "/admin", section: "ADMINISTRATION" },
-    { name: "KYC Management", icon: ShieldCheck, href: "/admin/kyc", section: "ADMINISTRATION" },
+    { name: "KYC Management", icon: ShieldCheck, href: "/admin/kyc-management", section: "ADMINISTRATION" },
     { name: "Users", icon: Users, href: "/admin/users", section: "ADMINISTRATION" },
-    { name: "All Plans", icon: FileText, href: "/admin/plans", section: "ADMINISTRATION" },
-    { name: "Activity Log", icon: Activity, href: "/admin/activity", section: "ADMINISTRATION" },
+    { name: "All Plans", icon: FileText, href: "/admin/all-plans", section: "ADMINISTRATION" },
+    { name: "Activity Log", icon: Activity, href: "/admin/activity-log", section: "ADMINISTRATION" },
 ];
 
 const quickLinks = [
