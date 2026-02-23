@@ -52,6 +52,7 @@ async fn admin_can_approve_kyc() {
         admin_id,
         email: "admin@example.com".to_string(),
         role: "super_admin".to_string(),
+        exp: 0,
     };
     let token = create_token(&admin_claims);
 
@@ -91,6 +92,7 @@ async fn user_cannot_approve_kyc() {
     let user_claims = UserClaims {
         user_id,
         email: "user@example.com".to_string(),
+        exp: 0,
     };
     let token = create_token(&user_claims);
 
@@ -123,6 +125,7 @@ async fn invalid_uuid_rejected() {
         admin_id,
         email: "admin@example.com".to_string(),
         role: "super_admin".to_string(),
+        exp: 0,
     };
     let token = create_token(&admin_claims);
 
