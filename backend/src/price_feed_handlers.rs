@@ -1,5 +1,6 @@
 use crate::api_error::ApiError;
 use crate::auth::AuthenticatedAdmin;
+use crate::notifications::AuditLogService;
 use crate::price_feed::{PriceFeedService, PriceFeedSource};
 use axum::extract::{Path, State};
 use axum::Json;
@@ -10,7 +11,6 @@ use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing;
-use crate::notifications::AuditLogService;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -140,7 +140,10 @@ pub async fn register_price_feed(
         None,
         Some("price_feed"),
         None,
-        Some(&format!("{}: {}/{}", req.asset_code, req.source, req.feed_id)),
+        Some(&format!(
+            "{}: {}/{}",
+            req.asset_code, req.source, req.feed_id
+        )),
         None,
     )
     .await?;
