@@ -393,9 +393,13 @@ impl LoanLifecycleService {
         AuditLogService::log(
             &mut *tx,
             Some(req.user_id),
+            None,
             audit_action::LOAN_CREATED,
             Some(record.id),
             Some(entity_type::LOAN),
+            None,
+            None,
+            None,
         )
         .await?;
 
@@ -475,6 +479,7 @@ impl LoanLifecycleService {
         AuditLogService::log(
             &mut *tx,
             Some(user_id),
+            None,
             if fully_repaid {
                 audit_action::LOAN_REPAID
             } else {
@@ -482,6 +487,9 @@ impl LoanLifecycleService {
             },
             Some(loan_id),
             Some(entity_type::LOAN),
+            None,
+            None,
+            None,
         )
         .await?;
 
@@ -540,10 +548,14 @@ impl LoanLifecycleService {
 
         AuditLogService::log(
             &mut *tx,
+            None,
             Some(admin_id),
             audit_action::LOAN_LIQUIDATED,
             Some(loan_id),
             Some(entity_type::LOAN),
+            None,
+            None,
+            None,
         )
         .await?;
 

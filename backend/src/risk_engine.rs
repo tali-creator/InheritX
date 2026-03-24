@@ -156,9 +156,13 @@ impl RiskEngine {
                     AuditLogService::log(
                         &mut *tx,
                         Some(loan.user_id),
+                        None,
                         audit_action::LIQUIDATION_WARNING,
                         Some(loan.plan_id),
                         Some(entity_type::PLAN),
+                        None,
+                        None,
+                        None,
                     )
                     .await?;
 

@@ -91,10 +91,14 @@ impl InterestReconciliationService {
                 // Log discrepancy to audit logs
                 AuditLogService::log(
                     &mut *tx,
-                    None, // System action
+                    None,
+                    None,
                     "yield_discrepancy_detected",
                     None,
                     Some("system"),
+                    None,
+                    None,
+                    None,
                 )
                 .await?;
 

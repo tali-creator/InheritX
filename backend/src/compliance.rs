@@ -216,9 +216,13 @@ impl ComplianceEngine {
         AuditLogService::log(
             &mut *tx,
             Some(user_id),
+            None,
             audit_action::SUSPICIOUS_BORROWING_DETECTED,
             Some(plan_id),
             Some(entity_type::PLAN),
+            None,
+            None,
+            None,
         )
         .await?;
 

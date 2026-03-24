@@ -170,6 +170,9 @@ pub mod audit_action {
     pub const LOAN_PARTIAL_REPAYMENT: &str = "loan_partial_repayment";
     pub const LOAN_LIQUIDATED: &str = "loan_liquidated";
     pub const LOAN_MARKED_OVERDUE: &str = "loan_marked_overdue";
+    // Admin & System
+    pub const EMERGENCY_STOP: &str = "emergency_stop";
+    pub const PARAMETER_UPDATE: &str = "parameter_update";
 }
 
 /// Entity type constants — stored in `entity_type` column of `action_logs`.
@@ -183,9 +186,13 @@ pub mod entity_type {
 pub struct ActionLog {
     pub id: Uuid,
     pub user_id: Option<Uuid>,
+    pub admin_id: Option<Uuid>,
     pub action: String,
     pub entity_id: Option<Uuid>,
     pub entity_type: Option<String>,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub metadata: Option<serde_json::Value>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -193,25 +200,34 @@ pub struct AuditLogService;
 
 impl AuditLogService {
     pub async fn log(
-        // Use an executor that can be a Pool or a Transaction
         executor: impl sqlx::PgExecutor<'_>,
         user_id: Option<Uuid>,
+        admin_id: Option<Uuid>,
         action: &str,
         entity_id: Option<Uuid>,
         entity_type: Option<&str>,
+        old_value: Option<&str>,
+        new_value: Option<&str>,
+        metadata: Option<serde_json::Value>,
     ) -> Result<(), ApiError> {
-        // Return Result instead of ()
         sqlx::query(
             r#"
-            INSERT INTO action_logs (user_id, action, entity_id, entity_type)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO action_logs (
+                user_id, admin_id, action, entity_id, entity_type, 
+                old_value, new_value, metadata
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
         .bind(user_id)
+        .bind(admin_id)
         .bind(action)
         .bind(entity_id)
         .bind(entity_type)
-        .execute(executor) // Execute on the provided transaction/pool
+        .bind(old_value)
+        .bind(new_value)
+        .bind(metadata)
+        .execute(executor)
         .await?;
 
         Ok(())
@@ -220,7 +236,8 @@ impl AuditLogService {
     pub async fn list_all(db: &PgPool) -> Result<Vec<ActionLog>, ApiError> {
         let rows = sqlx::query_as::<_, ActionLog>(
             r#"
-            SELECT id, user_id, action, entity_id, entity_type, timestamp
+            SELECT id, user_id, admin_id, action, entity_id, entity_type, 
+                   old_value, new_value, metadata, timestamp
             FROM action_logs
             ORDER BY timestamp DESC
             "#,
@@ -239,7 +256,8 @@ impl AuditLogService {
         let offset = ((page.saturating_sub(1)) as i64) * (limit as i64);
         let rows = sqlx::query_as::<_, ActionLog>(
             r#"
-            SELECT id, user_id, action, entity_id, entity_type, timestamp
+            SELECT id, user_id, admin_id, action, entity_id, entity_type, 
+                   old_value, new_value, metadata, timestamp
             FROM action_logs
             ORDER BY timestamp DESC
             LIMIT $1 OFFSET $2
@@ -270,13 +288,32 @@ impl AuditLogService {
     pub async fn list_for_user(db: &PgPool, user_id: Uuid) -> Result<Vec<ActionLog>, ApiError> {
         let rows = sqlx::query_as::<_, ActionLog>(
             r#"
-            SELECT id, user_id, action, entity_id, entity_type, timestamp
+            SELECT id, user_id, admin_id, action, entity_id, entity_type, 
+                   old_value, new_value, metadata, timestamp
             FROM action_logs
             WHERE user_id = $1
             ORDER BY timestamp DESC
             "#,
         )
         .bind(user_id)
+        .fetch_all(db)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Return audit log entries for a specific admin, newest first.
+    pub async fn list_for_admin(db: &PgPool, admin_id: Uuid) -> Result<Vec<ActionLog>, ApiError> {
+        let rows = sqlx::query_as::<_, ActionLog>(
+            r#"
+            SELECT id, user_id, admin_id, action, entity_id, entity_type, 
+                   old_value, new_value, metadata, timestamp
+            FROM action_logs
+            WHERE admin_id = $1
+            ORDER BY timestamp DESC
+            "#,
+        )
+        .bind(admin_id)
         .fetch_all(db)
         .await?;
 

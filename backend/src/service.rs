@@ -264,11 +264,15 @@ impl PlanService {
 
         // 3. Audit: This must now return Result and use the transaction
         AuditLogService::log(
-            &mut *tx, // Pass the transaction
+            &mut *tx,
             Some(user_id),
+            None,
             audit_action::PLAN_CREATED,
             Some(plan.id),
             Some(entity_type::PLAN),
+            None,
+            None,
+            None,
         )
         .await?; // If this fails, '?' triggers an early return
 
@@ -451,9 +455,13 @@ impl PlanService {
         AuditLogService::log(
             &mut *tx,
             Some(user_id),
+            None,
             audit_action::PLAN_CLAIMED,
             Some(plan_id),
             Some(entity_type::PLAN),
+            None,
+            None,
+            None,
         )
         .await?;
 
@@ -827,9 +835,13 @@ impl PlanService {
         AuditLogService::log(
             &mut *tx,
             Some(user_id),
+            None,
             audit_action::PLAN_DEACTIVATED,
             Some(plan_id),
             Some(entity_type::PLAN),
+            None,
+            None,
+            None,
         )
         .await?;
 
@@ -916,9 +928,13 @@ impl KycService {
         AuditLogService::log(
             &mut *tx, // Re-borrow here as well
             Some(user_id),
+            None,
             audit_action::KYC_SUBMITTED,
             Some(user_id),
             Some(entity_type::USER),
+            None,
+            None,
+            None,
         )
         .await?;
 
@@ -986,6 +1002,7 @@ impl KycService {
         // Audit log is now ATOMIC
         AuditLogService::log(
             &mut *tx,
+            None,
             Some(admin_id),
             if record.status == "approved" {
                 audit_action::KYC_APPROVED
@@ -994,6 +1011,9 @@ impl KycService {
             },
             Some(user_id),
             Some(entity_type::USER),
+            None,
+            None,
+            None,
         )
         .await?;
 
@@ -2488,10 +2508,14 @@ impl EmergencyAdminService {
         // Audit log
         AuditLogService::log(
             &mut *tx,
+            None,
             Some(admin_id),
             audit_action::PLAN_PAUSED,
             Some(req.plan_id),
             Some(entity_type::PLAN),
+            None,
+            None,
+            None,
         )
         .await?;
 
@@ -2559,10 +2583,14 @@ impl EmergencyAdminService {
         // Audit log
         AuditLogService::log(
             &mut *tx,
+            None,
             Some(admin_id),
             audit_action::PLAN_UNPAUSED,
             Some(req.plan_id),
             Some(entity_type::PLAN),
+            None,
+            None,
+            None,
         )
         .await?;
 
@@ -2650,10 +2678,14 @@ impl EmergencyAdminService {
         // Audit log
         AuditLogService::log(
             &mut *tx,
+            None,
             Some(admin_id),
             action_type,
             Some(req.plan_id),
             Some(entity_type::PLAN),
+            None,
+            None,
+            None,
         )
         .await?;
 

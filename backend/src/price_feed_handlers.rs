@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing;
+use crate::notifications::AuditLogService;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -130,6 +131,20 @@ pub async fn register_price_feed(
         .register_feed(&req.asset_code, source, &req.feed_id)
         .await?;
 
+    // Audit Log
+    AuditLogService::log(
+        &(_db),
+        None,
+        Some(_admin.admin_id),
+        crate::notifications::audit_action::PARAMETER_UPDATE,
+        None,
+        Some("price_feed"),
+        None,
+        Some(&format!("{}: {}/{}", req.asset_code, req.source, req.feed_id)),
+        None,
+    )
+    .await?;
+
     Ok(Json(json!({
         "status": "success",
         "message": format!("Price feed registered for {}", req.asset_code),
@@ -157,6 +172,20 @@ pub async fn update_price(
     }
 
     let asset_price = price_service.update_price(&asset_code, req.price).await?;
+
+    // Audit Log
+    AuditLogService::log(
+        &(_db),
+        None,
+        Some(_admin.admin_id),
+        crate::notifications::audit_action::PARAMETER_UPDATE,
+        None,
+        Some("price"),
+        None,
+        Some(&req.price.to_string()),
+        None,
+    )
+    .await?;
 
     Ok(Json(json!({
         "status": "success",

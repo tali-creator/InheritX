@@ -1,7 +1,7 @@
 use crate::api_error::ApiError;
 use crate::app::AppState;
 use crate::config::Config;
-use crate::notifications::AuditLogService;
+use crate::notifications::{audit_action, entity_type, AuditLogService};
 use axum::{extract::State, Json};
 use bcrypt::verify;
 use chrono::{DateTime, Duration, Utc};
@@ -385,9 +385,13 @@ pub async fn send_2fa(
     AuditLogService::log(
         &state.db,
         Some(payload.user_id),
-        "2fa_sent",
+        None,
+        audit_action::TWO_FA_SENT,
         Some(payload.user_id),
-        Some("user"),
+        Some(entity_type::USER),
+        None,
+        None,
+        None,
     )
     .await?;
 
