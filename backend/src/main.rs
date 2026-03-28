@@ -1,5 +1,8 @@
-use inheritx_backend::{create_app, db, telemetry, Config};
+use inheritx_backend::{
+    create_app, db, telemetry, Config, LegacyMessageDeliveryService, MessageKeyService,
+};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tracing::info;
 
 #[tokio::main]
@@ -16,24 +19,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run database migrations
     db::run_migrations(&db_pool).await?;
 
+    // Ensure there is always one active message encryption key.
+    MessageKeyService::ensure_active_key(&db_pool).await?;
+
     // Create application
     let app = create_app(db_pool.clone(), config.clone()).await?;
-
-    // Initialize Price Feed and Risk Engine
-    let price_feed = std::sync::Arc::new(inheritx_backend::DefaultPriceFeedService::new(
-        db_pool.clone(),
-        3600,
-    ));
-    if let Err(e) = price_feed.initialize_defaults().await {
-        tracing::warn!("Failed to initialize default price feeds: {}", e);
-    }
-
-    let risk_engine = std::sync::Arc::new(inheritx_backend::RiskEngine::new(
-        db_pool.clone(),
-        price_feed,
-        rust_decimal::Decimal::new(12, 1), // 1.2 health factor liquidation threshold
-    ));
-    risk_engine.start();
 
     let compliance_engine = std::sync::Arc::new(inheritx_backend::ComplianceEngine::new(
         db_pool.clone(),
@@ -44,14 +34,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     compliance_engine.start();
 
     // Initialize Interest Reconciliation Service
-    let yield_service = std::sync::Arc::new(inheritx_backend::DefaultOnChainYieldService::new());
-    let interest_reconciliation =
-        std::sync::Arc::new(inheritx_backend::InterestReconciliationService::new(
-            db_pool.clone(),
-            yield_service,
-            rust_decimal::Decimal::new(1, 2), // 0.01 discrepancy threshold
-        ));
+    let yield_service = Arc::new(inheritx_backend::DefaultOnChainYieldService::new());
+    let interest_reconciliation = Arc::new(inheritx_backend::InterestReconciliationService::new(
+        db_pool.clone(),
+        yield_service,
+        rust_decimal::Decimal::new(1, 2), // 0.01 discrepancy threshold
+    ));
     interest_reconciliation.start();
+
+    // Initialize Lending Notification Service
+    let lending_notification_service = std::sync::Arc::new(
+        inheritx_backend::LendingNotificationService::new(db_pool.clone()),
+    );
+    lending_notification_service.start();
+
+    // Start legacy message delivery worker.
+    let legacy_message_delivery_service =
+        Arc::new(LegacyMessageDeliveryService::new(db_pool.clone()));
+    legacy_message_delivery_service.start();
 
     // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));

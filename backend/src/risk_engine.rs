@@ -142,9 +142,10 @@ impl RiskEngine {
                         loan.plan_id, loan.user_id, health_factor
                     );
 
-                    let mut tx = self.db.begin().await.map_err(|e| {
-                        ApiError::Internal(anyhow::anyhow!("Tx start error: {e}"))
-                    })?;
+                    let mut tx =
+                        self.db.begin().await.map_err(|e| {
+                            ApiError::Internal(anyhow::anyhow!("Tx start error: {e}"))
+                        })?;
 
                     NotificationService::create(
                         &mut tx,
@@ -166,9 +167,9 @@ impl RiskEngine {
                     )
                     .await?;
 
-                    tx.commit().await.map_err(|e| {
-                        ApiError::Internal(anyhow::anyhow!("Tx commit error: {e}"))
-                    })?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| ApiError::Internal(anyhow::anyhow!("Tx commit error: {e}")))?;
                 } else if !is_now_risky && loan.is_risky.unwrap_or(false) {
                     info!(
                         "Plan {} for User {} is no longer risky. HF: {}",

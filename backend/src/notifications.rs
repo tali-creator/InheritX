@@ -1,3 +1,4 @@
+use crate::alert_provider::AlertProvider;
 use crate::api_error::ApiError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -15,11 +16,20 @@ pub mod notif_type {
     pub const PLAN_DEACTIVATED: &str = "plan_deactivated";
     pub const TWO_FA_SENT: &str = "2fa_sent";
     pub const LIQUIDATION_WARNING: &str = "liquidation_warning";
+    pub const REPAYMENT_REMINDER: &str = "repayment_reminder";
+    pub const YIELD_UPDATE: &str = "yield_update";
     pub const PLAN_PAUSED: &str = "plan_paused";
     pub const PLAN_UNPAUSED: &str = "plan_unpaused";
     pub const RISK_OVERRIDE_APPLIED: &str = "risk_override_applied";
     pub const RISK_OVERRIDE_REMOVED: &str = "risk_override_removed";
+    // Emergency access notifications (Issue #293)
+    pub const EMERGENCY_ACCESS_GRANTED: &str = "emergency_access_granted";
+    pub const EMERGENCY_ACCESS_REVOKED: &str = "emergency_access_revoked";
+    pub const EMERGENCY_ACCESS_EXPIRING: &str = "emergency_access_expiring";
     pub const SUSPICIOUS_ACTIVITY_FLAGGED: &str = "suspicious_activity_flagged";
+    // Insurance fund monitoring (Issue #249)
+    pub const ADMIN_ALERT: &str = "admin_alert";
+    pub const FUND_STATUS_CHANGE: &str = "fund_status_change";
 }
 
 // ─── Notification ────────────────────────────────────────────────────────────
@@ -147,6 +157,71 @@ impl NotificationService {
         row.ok_or_else(|| ApiError::NotFound(format!("Notification {notif_id} not found")))
     }
 }
+
+// ─── Emergency Alert Service ────────────────────────────────────────────────
+
+pub struct EmergencyAlertService;
+
+impl EmergencyAlertService {
+    /// Send risk alerts via SMS and Email to both the user and their emergency contact.
+    pub async fn send_risk_alert(
+        db: &PgPool,
+        provider: &impl AlertProvider,
+        user_id: Uuid,
+        contact_id: Uuid,
+        alert_type: &str,
+        message: &str,
+    ) -> Result<(), ApiError> {
+        // 1. Fetch user email
+        let user_email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(db)
+            .await?;
+
+        // 2. Fetch contact info
+        let contact: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT email, phone FROM emergency_contacts WHERE id = $1")
+                .bind(contact_id)
+                .fetch_one(db)
+                .await?;
+
+        let (contact_email, contact_phone) = contact;
+
+        // 3. Send to user (Email)
+        provider
+            .send_email(
+                &user_email,
+                &format!("Security Alert: {}", alert_type),
+                message,
+            )
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+
+        // 4. Send to contact (Email and/or SMS)
+        if let Some(email) = contact_email {
+            provider
+                .send_email(
+                    &email,
+                    &format!("Emergency Alert for your contact: {}", alert_type),
+                    message,
+                )
+                .await
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+        }
+
+        if let Some(phone) = contact_phone {
+            provider
+                .send_sms(
+                    &phone,
+                    &format!("Emergency Alert: {}. Message: {}", alert_type, message),
+                )
+                .await
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+        }
+
+        Ok(())
+    }
+}
 // ─── Audit Log ───────────────────────────────────────────────────────────────
 
 /// Well-known action values stored in the `action` column of `action_logs`.
@@ -173,6 +248,18 @@ pub mod audit_action {
     // Admin & System
     pub const EMERGENCY_STOP: &str = "emergency_stop";
     pub const PARAMETER_UPDATE: &str = "parameter_update";
+    // Emergency access (Issue #293)
+    pub const EMERGENCY_ACCESS_GRANTED: &str = "emergency_access_granted";
+    pub const EMERGENCY_ACCESS_REVOKED: &str = "emergency_access_revoked";
+    pub const EMERGENCY_ACCESS_EXPIRED: &str = "emergency_access_expired";
+    // Insurance fund monitoring (Issue #249)
+    pub const FUND_STATUS_CHANGE: &str = "fund_status_change";
+    pub const REPAYMENT_REMINDER_SENT: &str = "repayment_reminder_sent";
+    pub const YIELD_UPDATE_SENT: &str = "yield_update_sent";
+    // Insurance fund monitoring (Issue #249)
+    pub const INSURANCE_CLAIM_CREATED: &str = "insurance_claim_created";
+    pub const INSURANCE_CLAIM_PROCESSED: &str = "insurance_claim_processed";
+    pub const INSURANCE_CLAIM_PAID: &str = "insurance_claim_paid";
 }
 
 /// Entity type constants — stored in `entity_type` column of `action_logs`.
@@ -180,6 +267,9 @@ pub mod entity_type {
     pub const USER: &str = "user";
     pub const PLAN: &str = "plan";
     pub const LOAN: &str = "loan";
+    // Insurance fund monitoring (Issue #249)
+    pub const INSURANCE_FUND: &str = "insurance_fund";
+    pub const INSURANCE_CLAIM: &str = "insurance_claim";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

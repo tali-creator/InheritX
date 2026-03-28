@@ -59,9 +59,10 @@ impl TryFrom<LendingEventRow> for LendingEvent {
             user_id: row.user_id,
             plan_id: row.plan_id,
             asset_code: row.asset_code,
-            amount: row.amount.parse().map_err(|e| {
-                ApiError::Internal(anyhow::anyhow!("Failed to parse amount: {e}"))
-            })?,
+            amount: row
+                .amount
+                .parse()
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("Failed to parse amount: {e}")))?,
             metadata: row.metadata,
             transaction_hash: row.transaction_hash,
             block_number: row.block_number,

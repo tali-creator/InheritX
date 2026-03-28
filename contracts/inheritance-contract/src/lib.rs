@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, vec, Address,
-    Bytes, BytesN, Env, IntoVal, InvokeError, String, Symbol, Val, Vec,
+    Bytes, BytesN, Env, FromVal, IntoVal, InvokeError, String, Symbol, Val, Vec,
 };
 
 /// Current contract version - bump this on each upgrade
@@ -105,6 +105,13 @@ pub enum InheritanceError {
     EmergencyContactNotFound = 41,
     EmergencyContactAlreadyExists = 42,
     TooManyEmergencyContacts = 43,
+    WillHashAlreadyStored = 44,
+    WillAlreadyLinked = 45,
+    VaultNotFound = 46,
+    VerificationFailed = 47,
+    WillVersionNotFound = 48,
+    WillAlreadyFinalized = 49,
+    WillNotVerified = 50,
 }
 
 #[contracttype]
@@ -127,6 +134,21 @@ pub enum DataKey {
     Guardians(u64),                   // per-plan guardian configuration
     EmergencyApprovals(u64, Address), // (plan_id, trusted_contact) -> Vec<Address>
     EmergencyContacts(u64),           // per-plan emergency contacts list
+    WillHash(u64),                    // plan_id -> BytesN<32> (will document hash)
+    VaultWill(u64),                   // plan_id -> BytesN<32> (linked will hash)
+    BeneficiaryVerification(u64),     // plan_id -> bool (last verification result)
+    WillVersionCount(u64),            // plan_id -> u32 (number of will versions)
+    WillVersion(u64, u32),            // (plan_id, version) -> WillVersion struct
+    ActiveWillVersion(u64),           // plan_id -> u32 (active version number)
+    WillSignature(u64),               // plan_id -> WillSignatureProof
+    SignatureUsed(BytesN<32>),        // sig_hash -> bool (replay protection)
+    NextMessageId,                    // Global next message ID counter
+    LegacyMessage(u64),               // message_id -> LegacyMessageMetadata
+    VaultMessages(u64),               // vault_id -> Vec<u64> (message IDs)
+    WillFinalized(u64, u32),          // (plan_id, version) -> bool
+    WillFinalizedAt(u64, u32),        // (plan_id, version) -> u64 timestamp
+    WillWitnesses(u64),               // plan_id -> Vec<Address>
+    WitnessSignature(u64, Address),   // (plan_id, witness) -> u64 (signed_at)
 }
 
 #[contracttype]
@@ -322,12 +344,172 @@ pub struct EmergencyContactAddedEvent {
     pub contact: Address,
 }
 
+/// Legacy message metadata stored on-chain
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyMessageMetadata {
+    pub vault_id: u64,            // Associated vault/plan ID
+    pub message_id: u64,          // Unique message identifier
+    pub message_hash: BytesN<32>, // Cryptographic hash of message content (off-chain)
+    pub creator: Address,         // Message creator (vault owner)
+    pub key_reference: String,    // Reference for decryption key (#364)
+    pub unlock_timestamp: u64,    // Timestamp when message becomes accessible
+    pub is_unlocked: bool,        // Whether message has been unlocked
+    pub is_finalized: bool,       // Whether message has been finalized (#363)
+    pub created_at: u64,          // Message creation timestamp
+}
+
+/// Parameters for creating a legacy message
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateLegacyMessageParams {
+    pub vault_id: u64,
+    pub message_hash: BytesN<32>,
+    pub unlock_timestamp: u64,
+    pub key_reference: String, // Addition for #364
+}
+
+/// Event emitted when a legacy message is created
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageCreatedEvent {
+    pub vault_id: u64,
+    pub message_id: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageUpdatedEvent {
+    pub vault_id: u64,
+    pub message_id: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageFinalizedEvent {
+    pub vault_id: u64,
+    pub message_id: u64,
+    pub timestamp: u64,
+}
+
+/// Event emitted when a legacy message is deleted
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageDeletedEvent {
+    pub vault_id: u64,
+    pub message_id: u64,
+    pub timestamp: u64,
+}
+
+/// Event emitted when a message is unlocked
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageUnlockedEvent {
+    pub vault_id: u64,
+    pub message_id: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageAccessedEvent {
+    pub vault_id: u64,
+    pub message_id: u64,
+    pub timestamp: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmergencyContactRemovedEvent {
     pub plan_id: u64,
     pub contact: Address,
 }
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WillVersionInfo {
+    pub version: u32,
+    pub will_hash: BytesN<32>,
+    pub created_at: u64,
+    pub is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WillHashStoredEvent {
+    pub plan_id: u64,
+    pub will_hash: BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WillLinkedToVaultEvent {
+    pub plan_id: u64,
+    pub will_hash: BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeneficiariesVerifiedEvent {
+    pub plan_id: u64,
+    pub status: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WillVersionCreatedEvent {
+    pub plan_id: u64,
+    pub version: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WillVersionActivatedEvent {
+    pub plan_id: u64,
+    pub version: u32,
+}
+
+/// Proof that a vault owner has cryptographically signed a will.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WillSignatureProof {
+    pub vault_id: u64,
+    pub will_hash: BytesN<32>,
+    pub signer: Address,
+    pub sig_hash: BytesN<32>,
+    pub signed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WillSignedEvent {
+    pub vault_id: u64,
+    pub signer: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WillFinalizedEvent {
+    pub vault_id: u64,
+    pub version: u32,
+    pub finalized_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WitnessAddedEvent {
+    pub vault_id: u64,
+    pub witness: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WitnessSignedEvent {
+    pub vault_id: u64,
+    pub witness: Address,
+}
+
 /// Parameters for creating an inheritance plan (groups args to satisfy Clippy).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -445,6 +627,7 @@ impl InheritanceContract {
 
     // Validation functions
     pub fn validate_plan_inputs(
+        env: &Env,
         plan_name: String,
         description: String,
         asset_type: Symbol,
@@ -461,7 +644,7 @@ impl InheritanceContract {
         }
 
         // Validate asset type (only USDC allowed)
-        if asset_type != Symbol::new(&Env::default(), "USDC") {
+        if asset_type != Symbol::new(env, "USDC") {
             return Err(InheritanceError::InvalidAssetType);
         }
 
@@ -489,6 +672,32 @@ impl InheritanceContract {
         let total_allocation: u32 = beneficiaries_data.iter().map(|(_, _, _, _, bp)| bp).sum();
         if total_allocation != 10000 {
             return Err(InheritanceError::AllocationPercentageMismatch);
+        }
+
+        Ok(())
+    }
+
+    /// Check if a user has approved KYC status
+    ///
+    /// # Arguments
+    /// * `env` - The environment
+    /// * `user` - The user address to check
+    ///
+    /// # Returns
+    /// Ok(()) if user has approved KYC, Err(InheritanceError) otherwise
+    ///
+    /// # Errors
+    /// - KycNotSubmitted: If user has not submitted KYC
+    fn check_kyc_approved(env: &Env, user: &Address) -> Result<(), InheritanceError> {
+        let key = DataKey::Kyc(user.clone());
+        let status: KycStatus = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(InheritanceError::KycNotSubmitted)?;
+
+        if !status.approved {
+            return Err(InheritanceError::KycNotSubmitted);
         }
 
         Ok(())
@@ -891,6 +1100,9 @@ impl InheritanceContract {
         // Require owner authorization
         owner.require_auth();
 
+        // Check KYC approval - only approved users can create plans
+        Self::check_kyc_approved(&env, &owner)?;
+
         // Admin must be set to receive the fee
         let admin = Self::get_admin(&env).ok_or(InheritanceError::AdminNotSet)?;
 
@@ -910,6 +1122,7 @@ impl InheritanceContract {
         // Validate plan inputs using user input for "full amount" validation
         let usdc_symbol = Symbol::new(&env, "USDC");
         Self::validate_plan_inputs(
+            &env,
             plan_name.clone(),
             description.clone(),
             usdc_symbol.clone(),
@@ -1051,19 +1264,11 @@ impl InheritanceContract {
 
         let mut plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
 
-        // Authorization check: owner or active emergency contact
-        let mut is_authorized = plan.owner == caller;
-        if !is_authorized {
-            if let Some(record) = Self::get_emergency_access(env.clone(), plan_id) {
-                if record.trusted_contact == caller {
-                    is_authorized = true;
-                }
-            }
-        }
-
-        if !is_authorized {
+        // Authorization check: owner only
+        if plan.owner != caller {
             return Err(InheritanceError::Unauthorized);
         }
+
         if !plan.is_active {
             return Err(InheritanceError::PlanNotActive);
         }
@@ -1112,18 +1317,21 @@ impl InheritanceContract {
         }
         let mut plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
 
-        // Authorization check: owner or active emergency contact
-        let mut is_authorized = plan.owner == caller;
-        if !is_authorized {
-            if let Some(record) = Self::get_emergency_access(env.clone(), plan_id) {
-                if record.trusted_contact == caller {
-                    is_authorized = true;
-                }
-            }
+        // Authorization check: owner only
+        if plan.owner != caller {
+            return Err(InheritanceError::Unauthorized);
         }
 
-        if !is_authorized {
-            return Err(InheritanceError::Unauthorized);
+        // Emergency Guard: Limit withdrawal if emergency access was recently activated
+        if Self::is_emergency_active(&env, plan_id) {
+            let limit = (plan.total_amount as u128)
+                .checked_mul(EMERGENCY_TRANSFER_LIMIT_BP as u128)
+                .and_then(|v| v.checked_div(10000))
+                .unwrap_or(0) as u64;
+
+            if amount > limit {
+                return Err(InheritanceError::EmergencyCooldownActive);
+            }
         }
 
         // Emergency Guard: Limit withdrawal if emergency access was recently activated
@@ -1183,9 +1391,16 @@ impl InheritanceContract {
     pub fn claim_inheritance_plan(
         env: Env,
         plan_id: u64,
+        claimer: Address,
         email: String,
         claim_code: u32,
     ) -> Result<(), InheritanceError> {
+        // Require claimer authorization
+        claimer.require_auth();
+
+        // Check KYC approval - only approved users can claim plans
+        Self::check_kyc_approved(&env, &claimer)?;
+
         // Fetch the plan
         let plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
 
@@ -2381,6 +2596,962 @@ impl InheritanceContract {
 
         Ok(())
     }
+
+    // ── Will Management System (Issues #314–#317) ──
+
+    /// Store a SHA-256 hash of a will document on-chain, mapped to a plan_id.
+    pub fn store_will_hash(
+        env: Env,
+        owner: Address,
+        plan_id: u64,
+        will_hash: BytesN<32>,
+    ) -> Result<(), InheritanceError> {
+        owner.require_auth();
+
+        let plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+        if plan.owner != owner {
+            return Err(InheritanceError::Unauthorized);
+        }
+
+        let key = DataKey::WillHash(plan_id);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, BytesN<32>>(&key)
+            .is_some()
+        {
+            return Err(InheritanceError::WillHashAlreadyStored);
+        }
+
+        env.storage().persistent().set(&key, &will_hash);
+
+        env.events().publish(
+            (symbol_short!("WILL"), symbol_short!("STORED")),
+            WillHashStoredEvent { plan_id, will_hash },
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve the stored will hash for a plan.
+    pub fn get_will_hash(env: Env, plan_id: u64) -> Option<BytesN<32>> {
+        let key = DataKey::WillHash(plan_id);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Link a will document hash to a vault (plan). Prevents re-linking unless
+    /// the will versioning system is used (create_will_version updates VaultWill).
+    pub fn link_will_to_vault(
+        env: Env,
+        owner: Address,
+        plan_id: u64,
+        will_hash: BytesN<32>,
+    ) -> Result<(), InheritanceError> {
+        owner.require_auth();
+
+        let plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::VaultNotFound)?;
+        if plan.owner != owner {
+            return Err(InheritanceError::Unauthorized);
+        }
+
+        let key = DataKey::VaultWill(plan_id);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, BytesN<32>>(&key)
+            .is_some()
+        {
+            return Err(InheritanceError::WillAlreadyLinked);
+        }
+
+        env.storage().persistent().set(&key, &will_hash);
+
+        env.events().publish(
+            (symbol_short!("WILL"), symbol_short!("LINKED")),
+            WillLinkedToVaultEvent { plan_id, will_hash },
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve the will hash linked to a vault.
+    pub fn get_vault_will(env: Env, plan_id: u64) -> Option<BytesN<32>> {
+        let key = DataKey::VaultWill(plan_id);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Verify that the beneficiaries in a will document match those stored in the plan.
+    /// Takes a list of (hashed_email, allocation_bp) pairs and compares against the plan.
+    pub fn verify_beneficiaries(
+        env: Env,
+        plan_id: u64,
+        will_beneficiaries: Vec<(BytesN<32>, u32)>,
+    ) -> Result<bool, InheritanceError> {
+        let plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+
+        let plan_bens = &plan.beneficiaries;
+        let mut status = true;
+
+        // Check count matches
+        if will_beneficiaries.len() != plan_bens.len() {
+            status = false;
+        } else {
+            // For each will beneficiary, find a matching plan beneficiary
+            for i in 0..will_beneficiaries.len() {
+                let (ref wh_email, w_alloc) = will_beneficiaries.get(i).unwrap();
+                let mut found = false;
+                for j in 0..plan_bens.len() {
+                    let pb = plan_bens.get(j).unwrap();
+                    if pb.hashed_email == *wh_email && pb.allocation_bp == w_alloc {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    status = false;
+                    break;
+                }
+            }
+        }
+
+        // Store verification result
+        let ver_key = DataKey::BeneficiaryVerification(plan_id);
+        env.storage().persistent().set(&ver_key, &status);
+
+        env.events().publish(
+            (symbol_short!("WILL"), symbol_short!("VERIFY")),
+            BeneficiariesVerifiedEvent { plan_id, status },
+        );
+
+        Ok(status)
+    }
+
+    /// Get the last beneficiary verification status for a plan.
+    pub fn get_verification_status(env: Env, plan_id: u64) -> Option<bool> {
+        let key = DataKey::BeneficiaryVerification(plan_id);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Create a new will version for a plan. Auto-increments version number and
+    /// deactivates the previously active version. Also updates the VaultWill link.
+    pub fn create_will_version(
+        env: Env,
+        owner: Address,
+        plan_id: u64,
+        will_hash: BytesN<32>,
+    ) -> Result<u32, InheritanceError> {
+        owner.require_auth();
+
+        let plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+        if plan.owner != owner {
+            return Err(InheritanceError::Unauthorized);
+        }
+
+        // Block creating a new version if the currently active version is finalized
+        let active_key = DataKey::ActiveWillVersion(plan_id);
+        if let Some(active_ver_num) = env.storage().persistent().get::<_, u32>(&active_key) {
+            let fin_key = DataKey::WillFinalized(plan_id, active_ver_num);
+            if env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&fin_key)
+                .unwrap_or(false)
+            {
+                return Err(InheritanceError::WillAlreadyFinalized);
+            }
+        }
+
+        // Get and increment version count
+        let count_key = DataKey::WillVersionCount(plan_id);
+        let current_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let new_version = current_count + 1;
+        env.storage().persistent().set(&count_key, &new_version);
+
+        // Deactivate previously active version if any
+        let active_key = DataKey::ActiveWillVersion(plan_id);
+        if let Some(prev_ver_num) = env.storage().persistent().get::<_, u32>(&active_key) {
+            let prev_key = DataKey::WillVersion(plan_id, prev_ver_num);
+            if let Some(mut prev_ver) = env
+                .storage()
+                .persistent()
+                .get::<_, WillVersionInfo>(&prev_key)
+            {
+                prev_ver.is_active = false;
+                env.storage().persistent().set(&prev_key, &prev_ver);
+            }
+        }
+
+        // Store new version
+        let version_info = WillVersionInfo {
+            version: new_version,
+            will_hash: will_hash.clone(),
+            created_at: env.ledger().timestamp(),
+            is_active: true,
+        };
+        let ver_key = DataKey::WillVersion(plan_id, new_version);
+        env.storage().persistent().set(&ver_key, &version_info);
+
+        // Set as active
+        env.storage().persistent().set(&active_key, &new_version);
+
+        // Update VaultWill link to point to latest will hash
+        let vault_will_key = DataKey::VaultWill(plan_id);
+        env.storage().persistent().set(&vault_will_key, &will_hash);
+
+        env.events().publish(
+            (symbol_short!("WILL"), symbol_short!("VERSION")),
+            WillVersionCreatedEvent {
+                plan_id,
+                version: new_version,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("WILL"), symbol_short!("ACTIVE")),
+            WillVersionActivatedEvent {
+                plan_id,
+                version: new_version,
+            },
+        );
+
+        Ok(new_version)
+    }
+
+    /// Get a specific will version for a plan.
+    pub fn get_will_version(env: Env, plan_id: u64, version: u32) -> Option<WillVersionInfo> {
+        let key = DataKey::WillVersion(plan_id, version);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Get the currently active will version for a plan.
+    pub fn get_active_will_version(env: Env, plan_id: u64) -> Option<WillVersionInfo> {
+        let active_key = DataKey::ActiveWillVersion(plan_id);
+        if let Some(active_ver) = env.storage().persistent().get::<_, u32>(&active_key) {
+            let key = DataKey::WillVersion(plan_id, active_ver);
+            env.storage().persistent().get(&key)
+        } else {
+            None
+        }
+    }
+
+    /// Get the total number of will versions for a plan.
+    pub fn get_will_version_count(env: Env, plan_id: u64) -> u32 {
+        let key = DataKey::WillVersionCount(plan_id);
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    // ── Will Signature Verification (Issue #318) ──
+
+    /// Record that the vault owner has approved and signed a will.
+    ///
+    /// The caller must be the plan owner. A composite sig_hash is derived from
+    /// (vault_id, will_hash) to bind the signature to a specific will version and
+    /// prevent replay across different vaults or will documents.
+    pub fn sign_will(
+        env: Env,
+        owner: Address,
+        vault_id: u64,
+        will_hash: BytesN<32>,
+    ) -> Result<(), InheritanceError> {
+        owner.require_auth();
+
+        // Verify the plan exists and caller is the owner
+        let plan = Self::get_plan(&env, vault_id).ok_or(InheritanceError::PlanNotFound)?;
+        if plan.owner != owner {
+            return Err(InheritanceError::Unauthorized);
+        }
+
+        // Derive a deterministic sig_hash from (vault_id, will_hash) for replay protection
+        let mut sig_input = Bytes::new(&env);
+        for b in vault_id.to_be_bytes() {
+            sig_input.push_back(b);
+        }
+        for b in will_hash.to_array() {
+            sig_input.push_back(b);
+        }
+        let sig_hash: BytesN<32> = env.crypto().sha256(&sig_input).into();
+
+        // Replay protection: reject if this (vault_id, will_hash) pair was already signed
+        let used_key = DataKey::SignatureUsed(sig_hash.clone());
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&used_key)
+            .unwrap_or(false)
+        {
+            return Err(InheritanceError::WillAlreadyFinalized);
+        }
+
+        // Mark signature as used
+        env.storage().persistent().set(&used_key, &true);
+
+        // Store the signature proof
+        let proof = WillSignatureProof {
+            vault_id,
+            will_hash,
+            signer: owner.clone(),
+            sig_hash,
+            signed_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::WillSignature(vault_id), &proof);
+
+        // Emit WillSigned event
+        env.events().publish(
+            (symbol_short!("WILL"), symbol_short!("SIGNED")),
+            WillSignedEvent {
+                vault_id,
+                signer: owner,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve the stored will signature proof for a vault.
+    pub fn get_will_signature(env: Env, vault_id: u64) -> Option<WillSignatureProof> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WillSignature(vault_id))
+    }
+
+    /// Create a new legacy message with metadata stored on-chain
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `creator` - The address of the message creator (must be vault owner)
+    /// * `params` - Message creation parameters including hash and unlock timestamp
+    ///
+    /// # Requirements
+    /// - Creator must be the vault owner
+    /// - Unlock timestamp must be in the future
+    /// - Vault/plan must exist
+    pub fn create_legacy_message(
+        env: Env,
+        creator: Address,
+        params: CreateLegacyMessageParams,
+    ) -> Result<u64, InheritanceError> {
+        // Verify vault/plan exists and creator is the owner
+        let plan = Self::get_plan(&env, params.vault_id).ok_or(InheritanceError::PlanNotFound)?;
+        if plan.owner != creator {
+            return Err(InheritanceError::Unauthorized);
+        }
+
+        // Validate unlock timestamp is in the future
+        let current_timestamp = env.ledger().timestamp();
+        if params.unlock_timestamp <= current_timestamp {
+            return Err(InheritanceError::InvalidClaimCode); // Reuse for invalid timestamp
+        }
+
+        // Generate unique message ID
+        let message_id = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextMessageId)
+            .unwrap_or(0u64);
+
+        // Create message metadata
+        let message = LegacyMessageMetadata {
+            vault_id: params.vault_id,
+            message_id,
+            message_hash: params.message_hash,
+            creator: creator.clone(),
+            key_reference: params.key_reference,
+            unlock_timestamp: params.unlock_timestamp,
+            is_unlocked: false,
+            is_finalized: false,
+            created_at: current_timestamp,
+        };
+
+        // Store message metadata
+        env.storage()
+            .persistent()
+            .set(&DataKey::LegacyMessage(message_id), &message);
+
+        // Add message to vault's message list
+        let mut vault_messages: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VaultMessages(params.vault_id))
+            .unwrap_or_else(|| vec![&env]);
+        vault_messages.push_back(message_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VaultMessages(params.vault_id), &vault_messages);
+
+        // Increment next message ID
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextMessageId, &(message_id + 1));
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "message_created"), params.vault_id),
+            MessageCreatedEvent {
+                vault_id: params.vault_id,
+                message_id,
+                timestamp: current_timestamp,
+            },
+        );
+
+        Ok(message_id)
+    }
+
+    pub fn update_legacy_message(
+        env: Env,
+        creator: Address,
+        message_id: u64,
+        params: CreateLegacyMessageParams,
+    ) -> Result<(), InheritanceError> {
+        creator.require_auth();
+
+        let mut message = env
+            .storage()
+            .persistent()
+            .get::<_, LegacyMessageMetadata>(&DataKey::LegacyMessage(message_id))
+            .ok_or(InheritanceError::PlanNotFound)?;
+
+        if message.creator != creator {
+            return Err(InheritanceError::Unauthorized);
+        }
+
+        if message.is_finalized {
+            return Err(InheritanceError::WillAlreadyFinalized);
+        }
+
+        if message.is_unlocked {
+            return Err(InheritanceError::AlreadyClaimed);
+        }
+
+        message.message_hash = params.message_hash;
+        message.unlock_timestamp = params.unlock_timestamp;
+        message.key_reference = params.key_reference;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::LegacyMessage(message_id), &message);
+
+        env.events().publish(
+            (Symbol::new(&env, "message_updated"), message.vault_id),
+            MessageUpdatedEvent {
+                vault_id: message.vault_id,
+                message_id,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn finalize_legacy_message(
+        env: Env,
+        creator: Address,
+        message_id: u64,
+    ) -> Result<(), InheritanceError> {
+        creator.require_auth();
+
+        let mut message = env
+            .storage()
+            .persistent()
+            .get::<_, LegacyMessageMetadata>(&DataKey::LegacyMessage(message_id))
+            .ok_or(InheritanceError::PlanNotFound)?;
+
+        if message.creator != creator {
+            return Err(InheritanceError::Unauthorized);
+        }
+
+        if message.is_finalized {
+            return Err(InheritanceError::WillAlreadyFinalized);
+        }
+
+        message.is_finalized = true;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::LegacyMessage(message_id), &message);
+
+        env.events().publish(
+            (Symbol::new(&env, "message_finalized"), message.vault_id),
+            MessageFinalizedEvent {
+                vault_id: message.vault_id,
+                message_id,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Get metadata for a specific legacy message
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `message_id` - The unique message identifier
+    pub fn get_legacy_message(env: Env, message_id: u64) -> Option<LegacyMessageMetadata> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LegacyMessage(message_id))
+    }
+
+    /// Get all message IDs for a specific vault
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault/plan ID
+    pub fn get_vault_messages(env: Env, vault_id: u64) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VaultMessages(vault_id))
+            .unwrap_or_else(|| vec![&env])
+    }
+
+    /// Delete a legacy message before it has been finalized.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `owner` - The vault owner requesting deletion
+    /// * `message_id` - The message to delete
+    ///
+    /// # Errors
+    /// - `PlanNotFound` if the message does not exist
+    /// - `Unauthorized` if caller is not the message creator
+    /// - `WillAlreadyFinalized` if the message has been finalized
+    pub fn delete_legacy_message(
+        env: Env,
+        owner: Address,
+        message_id: u64,
+    ) -> Result<(), InheritanceError> {
+        owner.require_auth();
+
+        let message: LegacyMessageMetadata = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LegacyMessage(message_id))
+            .ok_or(InheritanceError::PlanNotFound)?;
+
+        if message.creator != owner {
+            return Err(InheritanceError::Unauthorized);
+        }
+
+        if message.is_finalized {
+            return Err(InheritanceError::WillAlreadyFinalized);
+        }
+
+        // Remove message metadata
+        env.storage()
+            .persistent()
+            .remove(&DataKey::LegacyMessage(message_id));
+
+        // Remove from vault's message list
+        let vault_messages: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VaultMessages(message.vault_id))
+            .unwrap_or_else(|| vec![&env]);
+        let mut updated: Vec<u64> = vec![&env];
+        for id in vault_messages.iter() {
+            if id != message_id {
+                updated.push_back(id);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::VaultMessages(message.vault_id), &updated);
+
+        env.events().publish(
+            (Symbol::new(&env, "message_deleted"), message.vault_id),
+            MessageDeletedEvent {
+                vault_id: message.vault_id,
+                message_id,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Access a legacy message (returns metadata if accessible)
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `caller` - The address requesting access
+    /// * `message_id` - The message ID to access
+    ///
+    /// # Requirements
+    /// - Caller must be a verified beneficiary of the vault
+    /// - Message must be unlocked (either by timestamp or inheritance trigger)
+    pub fn access_legacy_message(
+        env: Env,
+        caller: Address,
+        message_id: u64,
+    ) -> Result<LegacyMessageMetadata, InheritanceError> {
+        // Get message metadata
+        let mut message: LegacyMessageMetadata = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LegacyMessage(message_id))
+            .ok_or(InheritanceError::PlanNotFound)?; // Reuse PlanNotFound for MessageNotFound
+
+        // Check if already unlocked
+        if !message.is_unlocked {
+            let current_timestamp = env.ledger().timestamp();
+
+            // Check if unlock timestamp has been reached
+            if current_timestamp >= message.unlock_timestamp {
+                // Unlock by timestamp
+                message.is_unlocked = true;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::LegacyMessage(message_id), &message);
+
+                // Emit unlock event
+                env.events().publish(
+                    (Symbol::new(&env, "message_unlocked"), message.vault_id),
+                    MessageUnlockedEvent {
+                        vault_id: message.vault_id,
+                        message_id,
+                        timestamp: current_timestamp,
+                    },
+                );
+            } else {
+                // Check if inheritance has been triggered
+                let inheritance_triggered: bool = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::InheritanceTrigger(message.vault_id))
+                    .map(|info: InheritanceTriggerInfo| info.triggered_at > 0)
+                    .unwrap_or(false);
+
+                if inheritance_triggered {
+                    // Unlock by inheritance trigger
+                    message.is_unlocked = true;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::LegacyMessage(message_id), &message);
+
+                    // Emit unlock event
+                    env.events().publish(
+                        (Symbol::new(&env, "message_unlocked"), message.vault_id),
+                        MessageUnlockedEvent {
+                            vault_id: message.vault_id,
+                            message_id,
+                            timestamp: current_timestamp,
+                        },
+                    );
+                } else {
+                    // Message still locked
+                    return Err(InheritanceError::ClaimNotAllowedYet); // Reuse for locked message
+                }
+            }
+        }
+
+        // Verify caller is a beneficiary of this vault
+        let plan = Self::get_plan(&env, message.vault_id).ok_or(InheritanceError::PlanNotFound)?;
+
+        // Hash the caller's address to check against beneficiaries
+        let caller_bytes = Bytes::from_val(&env, &caller.to_val());
+        let caller_hash: BytesN<32> = env.crypto().sha256(&caller_bytes).into();
+        let mut is_beneficiary = false;
+
+        for i in 0..plan.beneficiaries.len() {
+            let beneficiary = plan
+                .beneficiaries
+                .get(i)
+                .ok_or(InheritanceError::BeneficiaryNotFound)?;
+            // Check if caller matches any beneficiary hashed email
+            if beneficiary.hashed_email == caller_hash {
+                is_beneficiary = true;
+                break;
+            }
+        }
+
+        if !is_beneficiary {
+            return Err(InheritanceError::Unauthorized);
+        }
+
+        // Emit access event
+        env.events().publish(
+            (Symbol::new(&env, "message_accessed"), message.vault_id),
+            MessageAccessedEvent {
+                vault_id: message.vault_id,
+                message_id,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(message)
+    }
+
+    /// Manually unlock a message when inheritance is triggered
+    /// This can be called during the inheritance trigger process
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault/plan ID for which inheritance was triggered
+    pub fn unlock_messages_on_inheritance(env: Env, vault_id: u64) -> Result<(), InheritanceError> {
+        // Verify inheritance was triggered
+        let trigger_info: InheritanceTriggerInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InheritanceTrigger(vault_id))
+            .ok_or(InheritanceError::InheritanceNotTriggered)?;
+
+        if trigger_info.triggered_at == 0 {
+            return Err(InheritanceError::InheritanceNotTriggered);
+        }
+
+        // Get all messages for this vault
+        let messages = Self::get_vault_messages(env.clone(), vault_id);
+        let current_timestamp = env.ledger().timestamp();
+
+        // Unlock each message
+        for message_id in messages.iter() {
+            let mut message: LegacyMessageMetadata = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::LegacyMessage(message_id))
+            {
+                Some(m) => m,
+                None => continue, // Skip if message doesn't exist
+            };
+
+            if !message.is_unlocked {
+                message.is_unlocked = true;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::LegacyMessage(message_id), &message);
+
+                // Emit unlock event
+                env.events().publish(
+                    (Symbol::new(&env, "message_unlocked"), vault_id),
+                    MessageUnlockedEvent {
+                        vault_id,
+                        message_id,
+                        timestamp: current_timestamp,
+                    },
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    // ── Will Finalization (Issue #319) ──
+
+    /// Finalize a specific will version, permanently locking it.
+    ///
+    /// Requirements:
+    /// - Caller must be the plan owner.
+    /// - The will version must exist.
+    /// - The owner must have signed the will (WillSignature must exist).
+    /// - If witnesses are assigned, all must have signed.
+    /// - Cannot finalize an already-finalized version.
+    pub fn finalize_will(
+        env: Env,
+        owner: Address,
+        vault_id: u64,
+        version: u32,
+    ) -> Result<(), InheritanceError> {
+        owner.require_auth();
+
+        let plan = Self::get_plan(&env, vault_id).ok_or(InheritanceError::PlanNotFound)?;
+        if plan.owner != owner {
+            return Err(InheritanceError::Unauthorized);
+        }
+
+        // Version must exist
+        let ver_key = DataKey::WillVersion(vault_id, version);
+        env.storage()
+            .persistent()
+            .get::<_, WillVersionInfo>(&ver_key)
+            .ok_or(InheritanceError::WillVersionNotFound)?;
+
+        // Already finalized?
+        let fin_key = DataKey::WillFinalized(vault_id, version);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&fin_key)
+            .unwrap_or(false)
+        {
+            return Err(InheritanceError::WillAlreadyFinalized);
+        }
+
+        // Owner must have signed the will
+        if env
+            .storage()
+            .persistent()
+            .get::<_, WillSignatureProof>(&DataKey::WillSignature(vault_id))
+            .is_none()
+        {
+            return Err(InheritanceError::WillNotVerified);
+        }
+
+        // All assigned witnesses must have signed
+        let witnesses_key = DataKey::WillWitnesses(vault_id);
+        let witnesses: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&witnesses_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        for i in 0..witnesses.len() {
+            let w = witnesses.get(i).unwrap();
+            let wsig_key = DataKey::WitnessSignature(vault_id, w);
+            if env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&wsig_key)
+                .is_none()
+            {
+                return Err(InheritanceError::MissingRequiredField);
+            }
+        }
+
+        let finalized_at = env.ledger().timestamp();
+        env.storage().persistent().set(&fin_key, &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::WillFinalizedAt(vault_id, version), &finalized_at);
+
+        env.events().publish(
+            (symbol_short!("WILL"), symbol_short!("FINAL")),
+            WillFinalizedEvent {
+                vault_id,
+                version,
+                finalized_at,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Check whether a specific will version is finalized.
+    pub fn is_will_finalized(env: Env, vault_id: u64, version: u32) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::WillFinalized(vault_id, version))
+            .unwrap_or(false)
+    }
+
+    /// Get the finalization timestamp for a will version (None if not finalized).
+    pub fn get_will_finalized_at(env: Env, vault_id: u64, version: u32) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WillFinalizedAt(vault_id, version))
+    }
+
+    // ── Legal Witness Verification (Issue #320) ──
+
+    /// Assign a witness address to a vault's will. Only the plan owner can add witnesses.
+    pub fn add_witness(
+        env: Env,
+        owner: Address,
+        vault_id: u64,
+        witness: Address,
+    ) -> Result<(), InheritanceError> {
+        owner.require_auth();
+
+        let plan = Self::get_plan(&env, vault_id).ok_or(InheritanceError::PlanNotFound)?;
+        if plan.owner != owner {
+            return Err(InheritanceError::Unauthorized);
+        }
+
+        let key = DataKey::WillWitnesses(vault_id);
+        let mut witnesses: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Prevent duplicates
+        for i in 0..witnesses.len() {
+            if witnesses.get(i).unwrap() == witness {
+                return Err(InheritanceError::EmergencyContactAlreadyExists);
+            }
+        }
+
+        witnesses.push_back(witness.clone());
+        env.storage().persistent().set(&key, &witnesses);
+
+        env.events().publish(
+            (symbol_short!("WILL"), symbol_short!("WITNESS")),
+            WitnessAddedEvent { vault_id, witness },
+        );
+
+        Ok(())
+    }
+
+    /// Record a witness signature for a vault's will.
+    ///
+    /// The caller must be a registered witness for this vault.
+    pub fn sign_as_witness(
+        env: Env,
+        witness: Address,
+        vault_id: u64,
+    ) -> Result<(), InheritanceError> {
+        witness.require_auth();
+
+        // Vault must exist
+        Self::get_plan(&env, vault_id).ok_or(InheritanceError::PlanNotFound)?;
+
+        // Witness must be in the registered list
+        let key = DataKey::WillWitnesses(vault_id);
+        let witnesses: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found = false;
+        for i in 0..witnesses.len() {
+            if witnesses.get(i).unwrap() == witness {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(InheritanceError::EmergencyContactNotFound);
+        }
+
+        // Prevent double-signing
+        let wsig_key = DataKey::WitnessSignature(vault_id, witness.clone());
+        if env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&wsig_key)
+            .is_some()
+        {
+            return Err(InheritanceError::AlreadyApproved);
+        }
+
+        let signed_at = env.ledger().timestamp();
+        env.storage().persistent().set(&wsig_key, &signed_at);
+
+        env.events().publish(
+            (symbol_short!("WILL"), symbol_short!("WSIGN")),
+            WitnessSignedEvent { vault_id, witness },
+        );
+
+        Ok(())
+    }
+
+    /// Get all registered witnesses for a vault.
+    pub fn get_witnesses(env: Env, vault_id: u64) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WillWitnesses(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Get the timestamp at which a witness signed, or None if not yet signed.
+    pub fn get_witness_signature(env: Env, vault_id: u64, witness: Address) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WitnessSignature(vault_id, witness))
+    }
 }
 
+#[cfg(test)]
+#[allow(clippy::duplicated_attributes)]
+mod message_test;
 mod test;

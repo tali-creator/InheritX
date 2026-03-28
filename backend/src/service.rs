@@ -93,6 +93,8 @@ pub struct PlanWithBeneficiary {
     pub contract_plan_id: Option<i64>,
     pub distribution_method: Option<String>,
     pub is_active: Option<bool>,
+    pub is_paused: Option<bool>,
+    pub risk_override_enabled: Option<bool>,
     pub contract_created_at: Option<i64>,
     pub beneficiary_name: Option<String>,
     pub bank_name: Option<String>,
@@ -133,6 +135,8 @@ struct PlanRowFull {
     contract_plan_id: Option<i64>,
     distribution_method: Option<String>,
     is_active: Option<bool>,
+    is_paused: Option<bool>,
+    risk_override_enabled: Option<bool>,
     contract_created_at: Option<i64>,
     beneficiary_name: Option<String>,
     bank_account_number: Option<String>,
@@ -152,13 +156,16 @@ fn plan_row_to_plan_with_beneficiary(row: &PlanRowFull) -> Result<PlanWithBenefi
             .fee
             .parse()
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("Failed to parse fee: {e}")))?,
-        net_amount: row.net_amount.parse().map_err(|e| {
-            ApiError::Internal(anyhow::anyhow!("Failed to parse net_amount: {e}"))
-        })?,
+        net_amount: row
+            .net_amount
+            .parse()
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("Failed to parse net_amount: {e}")))?,
         status: row.status.clone(),
         contract_plan_id: row.contract_plan_id,
         distribution_method: row.distribution_method.clone(),
         is_active: row.is_active,
+        is_paused: row.is_paused,
+        risk_override_enabled: row.risk_override_enabled,
         contract_created_at: row.contract_created_at,
         beneficiary_name: row.beneficiary_name.clone(),
         bank_name: row.bank_name.clone(),
@@ -167,6 +174,103 @@ fn plan_row_to_plan_with_beneficiary(row: &PlanRowFull) -> Result<PlanWithBenefi
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct InheritanceExecutionSafetyRow {
+    outstanding_debt: Option<Decimal>,
+    is_risky: Option<bool>,
+    risk_override_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct InheritanceExecutionSafety {
+    outstanding_debt: Decimal,
+    utilization_rate: Decimal,
+    is_risky: bool,
+    risk_override_enabled: bool,
+}
+
+impl InheritanceExecutionSafety {
+    fn from_plan_state(
+        net_amount: Decimal,
+        outstanding_debt: Decimal,
+        is_risky: bool,
+        risk_override_enabled: bool,
+    ) -> Self {
+        let utilization_rate = if outstanding_debt <= Decimal::ZERO {
+            Decimal::ZERO
+        } else if net_amount > Decimal::ZERO {
+            ((outstanding_debt / net_amount) * Decimal::from(100)).round_dp(2)
+        } else {
+            Decimal::from(100)
+        };
+
+        Self {
+            outstanding_debt,
+            utilization_rate,
+            is_risky,
+            risk_override_enabled,
+        }
+    }
+
+    fn blocking_reason(&self) -> Option<String> {
+        if self.is_risky && !self.risk_override_enabled {
+            return Some(format!(
+                "Inheritance execution is blocked because the plan is currently flagged as risky by the lending monitor (utilization: {}%, outstanding debt: {}).",
+                self.utilization_rate.normalize(),
+                self.outstanding_debt.round_dp(4).normalize()
+            ));
+        }
+
+        if self.outstanding_debt > Decimal::ZERO {
+            return Some(format!(
+                "Inheritance execution is blocked while plan funds remain utilized in lending (utilization: {}%, outstanding debt: {}).",
+                self.utilization_rate.normalize(),
+                self.outstanding_debt.round_dp(4).normalize()
+            ));
+        }
+
+        None
+    }
+}
+
+async fn load_inheritance_execution_safety<'a, E>(
+    executor: E,
+    plan_id: Uuid,
+    net_amount: Decimal,
+) -> Result<InheritanceExecutionSafety, ApiError>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
+    let row = sqlx::query_as::<_, InheritanceExecutionSafetyRow>(
+        r#"
+        WITH lending_balance AS (
+            SELECT
+                COALESCE(SUM(CASE WHEN event_type = 'borrow' THEN CAST(amount AS numeric) ELSE 0 END), 0) -
+                COALESCE(SUM(CASE WHEN event_type = 'repay' THEN CAST(amount AS numeric) ELSE 0 END), 0) -
+                COALESCE(SUM(CASE WHEN event_type = 'liquidation' THEN CAST(amount AS numeric) ELSE 0 END), 0) AS outstanding_debt
+            FROM lending_events
+            WHERE plan_id = $1
+        )
+        SELECT
+            lending_balance.outstanding_debt,
+            p.is_risky,
+            p.risk_override_enabled
+        FROM lending_balance
+        JOIN plans p ON p.id = $1
+        "#,
+    )
+    .bind(plan_id)
+    .fetch_one(executor)
+    .await?;
+
+    Ok(InheritanceExecutionSafety::from_plan_state(
+        net_amount,
+        row.outstanding_debt.unwrap_or(Decimal::ZERO),
+        row.is_risky.unwrap_or(false),
+        row.risk_override_enabled.unwrap_or(false),
+    ))
 }
 
 pub struct PlanService;
@@ -212,7 +316,15 @@ impl PlanService {
         crate::safe_math::SafeMath::ensure_non_negative(req.fee, "fee")?;
         crate::safe_math::SafeMath::ensure_non_negative(req.net_amount, "net_amount")?;
 
-        // 2. Start Transaction
+        // 2. Check KYC status - only approved users can create plans
+        let kyc_record = KycService::get_kyc_status(pool, user_id).await?;
+        if kyc_record.status != "approved" {
+            return Err(ApiError::Forbidden(
+                "KYC not approved: cannot create plan".to_string(),
+            ));
+        }
+
+        // 3. Start Transaction
         let mut tx = pool.begin().await?;
 
         let currency = CurrencyPreference::from_str(req.currency_preference.trim())?;
@@ -292,8 +404,8 @@ impl PlanService {
         let row = sqlx::query_as::<_, PlanRowFull>(
             r#"
         SELECT id, user_id, title, description, fee, net_amount, status,
-               contract_plan_id, distribution_method, is_active, contract_created_at,
-               beneficiary_name, bank_account_number, bank_name, currency_preference,
+               contract_plan_id, distribution_method, is_active, is_paused, risk_override_enabled,
+               contract_created_at, beneficiary_name, bank_account_number, bank_name, currency_preference,
                created_at, updated_at
         FROM plans
         WHERE id = $1 AND user_id = $2
@@ -320,8 +432,8 @@ impl PlanService {
         let row = sqlx::query_as::<_, PlanRowFull>(
             r#"
         SELECT id, user_id, title, description, fee, net_amount, status,
-               contract_plan_id, distribution_method, is_active, contract_created_at,
-               beneficiary_name, bank_account_number, bank_name, currency_preference,
+               contract_plan_id, distribution_method, is_active, is_paused, risk_override_enabled,
+               contract_created_at, beneficiary_name, bank_account_number, bank_name, currency_preference,
                created_at, updated_at
         FROM plans
         WHERE id = $1
@@ -342,15 +454,23 @@ impl PlanService {
         user_id: Uuid,
         req: &ClaimPlanRequest,
     ) -> Result<PlanWithBeneficiary, ApiError> {
-        // 1. Start the transaction
+        // 1. Check KYC status - only approved users can claim plans
+        let kyc_record = KycService::get_kyc_status(pool, user_id).await?;
+        if kyc_record.status != "approved" {
+            return Err(ApiError::Forbidden(
+                "KYC not approved: cannot claim plan".to_string(),
+            ));
+        }
+
+        // 2. Start the transaction
         let mut tx = pool.begin().await?;
 
-        // 2. Use SELECT FOR UPDATE to lock the plan row and prevent concurrent claims
+        // 3. Use SELECT FOR UPDATE to lock the plan row and prevent concurrent claims
         let row = sqlx::query_as::<_, PlanRowFull>(
             r#"
             SELECT id, user_id, title, description, fee, net_amount, status,
-                   contract_plan_id, distribution_method, is_active, contract_created_at,
-                   beneficiary_name, bank_account_number, bank_name, currency_preference,
+                   contract_plan_id, distribution_method, is_active, is_paused, risk_override_enabled,
+                   contract_created_at, beneficiary_name, bank_account_number, bank_name, currency_preference,
                    created_at, updated_at
             FROM plans
             WHERE id = $1 AND user_id = $2
@@ -368,13 +488,7 @@ impl PlanService {
         };
 
         // Check if plan is paused
-        let is_paused: Option<bool> =
-            sqlx::query_scalar("SELECT is_paused FROM plans WHERE id = $1")
-                .bind(plan_id)
-                .fetch_one(&mut *tx)
-                .await?;
-
-        if is_paused == Some(true) {
+        if plan.is_paused == Some(true) {
             return Err(ApiError::BadRequest(
                 "This plan is currently paused by an administrator and cannot be claimed"
                     .to_string(),
@@ -395,6 +509,12 @@ impl PlanService {
             return Err(ApiError::BadRequest(
                 "Plan is not yet mature for claim".to_string(),
             ));
+        }
+
+        let execution_safety =
+            load_inheritance_execution_safety(&mut *tx, plan_id, plan.net_amount).await?;
+        if let Some(reason) = execution_safety.blocking_reason() {
+            return Err(ApiError::BadRequest(reason));
         }
 
         let contract_plan_id = plan.contract_plan_id.unwrap_or(0_i64);
@@ -552,9 +672,10 @@ impl PlanService {
                 user_id: row.user_id,
                 title: row.title,
                 description: row.description,
-                fee: row.fee.parse().map_err(|e| {
-                    ApiError::Internal(anyhow::anyhow!("Failed to parse fee: {e}"))
-                })?,
+                fee: row
+                    .fee
+                    .parse()
+                    .map_err(|e| ApiError::Internal(anyhow::anyhow!("Failed to parse fee: {e}")))?,
                 net_amount: row.net_amount.parse().map_err(|e| {
                     ApiError::Internal(anyhow::anyhow!("Failed to parse net_amount: {e}"))
                 })?,
@@ -587,7 +708,11 @@ impl PlanService {
                 .await?;
 
                 if !has_claim {
-                    return Ok(Some(plan));
+                    let execution_safety =
+                        load_inheritance_execution_safety(db, plan.id, plan.net_amount).await?;
+                    if execution_safety.blocking_reason().is_none() {
+                        return Ok(Some(plan));
+                    }
                 }
             }
         }
@@ -683,7 +808,11 @@ impl PlanService {
                 .await?;
 
                 if !has_claim {
-                    due_plans.push(plan);
+                    let execution_safety =
+                        load_inheritance_execution_safety(db, plan.id, plan.net_amount).await?;
+                    if execution_safety.blocking_reason().is_none() {
+                        due_plans.push(plan);
+                    }
                 }
             }
         }
@@ -776,7 +905,11 @@ impl PlanService {
                 .await?;
 
                 if !has_claim {
-                    due_plans.push(plan);
+                    let execution_safety =
+                        load_inheritance_execution_safety(db, plan.id, plan.net_amount).await?;
+                    if execution_safety.blocking_reason().is_none() {
+                        due_plans.push(plan);
+                    }
                 }
             }
         }
@@ -2044,8 +2177,9 @@ impl LoanSimulationService {
 
 #[cfg(test)]
 mod tests {
-    use super::{CurrencyPreference, PlanService};
+    use super::{CurrencyPreference, InheritanceExecutionSafety, PlanService};
     use crate::api_error::ApiError;
+    use rust_decimal::Decimal;
     use std::str::FromStr;
 
     #[test]
@@ -2140,6 +2274,51 @@ mod tests {
             Some("12345678")
         )
         .is_err());
+    }
+
+    #[test]
+    fn inheritance_execution_safety_blocks_active_lending_utilization() {
+        let safety = InheritanceExecutionSafety::from_plan_state(
+            Decimal::new(1000, 0),
+            Decimal::new(250, 0),
+            false,
+            false,
+        );
+
+        let reason = safety
+            .blocking_reason()
+            .expect("expected active lending utilization to block execution");
+
+        assert!(reason.contains("utilized in lending"));
+        assert!(reason.contains("25"));
+    }
+
+    #[test]
+    fn inheritance_execution_safety_blocks_risky_plan_without_override() {
+        let safety = InheritanceExecutionSafety::from_plan_state(
+            Decimal::new(1000, 0),
+            Decimal::ZERO,
+            true,
+            false,
+        );
+
+        let reason = safety
+            .blocking_reason()
+            .expect("expected risky plans to block execution");
+
+        assert!(reason.contains("flagged as risky"));
+    }
+
+    #[test]
+    fn inheritance_execution_safety_allows_clean_plan() {
+        let safety = InheritanceExecutionSafety::from_plan_state(
+            Decimal::new(1000, 0),
+            Decimal::ZERO,
+            false,
+            false,
+        );
+
+        assert!(safety.blocking_reason().is_none());
     }
 
     // ========================================================================
@@ -2452,11 +2631,861 @@ pub struct RiskOverrideRequest {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct EmergencyContact {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub name: String,
+    pub relationship: String,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub wallet_address: Option<String>,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateEmergencyContactRequest {
+    pub name: String,
+    pub relationship: String,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub wallet_address: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateEmergencyContactRequest {
+    pub name: String,
+    pub relationship: String,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub wallet_address: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmergencyContactDeleteResponse {
+    pub success: bool,
+    pub contact_id: Uuid,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct EmergencyAccessGrant {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub emergency_contact_id: Uuid,
+    pub permissions: Vec<String>,
+    pub expires_at: DateTime<Utc>,
+    pub is_active: bool,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct EmergencyAccessAuditLog {
+    pub id: Uuid,
+    pub grant_id: Uuid,
+    pub user_id: Uuid,
+    pub emergency_contact_id: Uuid,
+    pub action: String,
+    pub metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct EmergencyAccessAuditLogFilters {
+    pub action: Option<String>,
+    pub grant_id: Option<Uuid>,
+    pub emergency_contact_id: Option<Uuid>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateEmergencyAccessGrantRequest {
+    pub emergency_contact_id: Uuid,
+    pub permissions: Vec<String>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeEmergencyAccessGrantRequest {
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmergencyAccessActionResponse {
+    pub success: bool,
+    pub grant: EmergencyAccessGrant,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct EmergencyAccessRiskAlert {
+    pub id: Uuid,
+    pub grant_id: Uuid,
+    pub user_id: Uuid,
+    pub emergency_contact_id: Uuid,
+    pub alert_type: String,
+    pub severity: String,
+    pub message: String,
+    pub metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmergencyAccessDashboardItem {
+    pub grant_id: Uuid,
+    pub emergency_contact_id: Uuid,
+    pub contact_name: String,
+    pub status: String,
+    pub active_access: bool,
+    pub permissions: Vec<String>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmergencyAccessDashboardResponse {
+    pub active_access_count: usize,
+    pub grants: Vec<EmergencyAccessDashboardItem>,
+}
+
+// ─── Emergency Access Sessions (Issue #306) ─────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct EmergencyAccessSession {
+    pub id: Uuid,
+    pub grant_id: Uuid,
+    pub user_id: Uuid,
+    pub emergency_contact_id: Uuid,
+    pub started_at: DateTime<Utc>,
+    pub last_active_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StartSessionRequest {
+    pub grant_id: Uuid,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EmergencyActionResponse {
     pub success: bool,
     pub plan_id: Uuid,
     pub message: String,
+}
+
+pub struct EmergencyContactService;
+
+impl EmergencyContactService {
+    fn normalize_optional(value: &Option<String>) -> Option<String> {
+        value.as_ref().and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    }
+
+    fn validate_contact_details(
+        name: &str,
+        relationship: &str,
+        email: &Option<String>,
+        phone: &Option<String>,
+        wallet_address: &Option<String>,
+    ) -> Result<(), ApiError> {
+        if name.trim().is_empty() {
+            return Err(ApiError::BadRequest(
+                "name is required for an emergency contact".to_string(),
+            ));
+        }
+
+        if relationship.trim().is_empty() {
+            return Err(ApiError::BadRequest(
+                "relationship is required for an emergency contact".to_string(),
+            ));
+        }
+
+        if email.is_none() && phone.is_none() && wallet_address.is_none() {
+            return Err(ApiError::BadRequest(
+                "at least one contact detail is required: email, phone, or wallet_address"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub async fn list_for_user(
+        pool: &PgPool,
+        user_id: Uuid,
+    ) -> Result<Vec<EmergencyContact>, ApiError> {
+        let contacts = sqlx::query_as::<_, EmergencyContact>(
+            r#"
+            SELECT id, user_id, name, relationship, email, phone, wallet_address, notes,
+                   created_at, updated_at
+            FROM emergency_contacts
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(contacts)
+    }
+
+    pub async fn create_contact(
+        pool: &PgPool,
+        user_id: Uuid,
+        req: &CreateEmergencyContactRequest,
+    ) -> Result<EmergencyContact, ApiError> {
+        let email = Self::normalize_optional(&req.email);
+        let phone = Self::normalize_optional(&req.phone);
+        let wallet_address = Self::normalize_optional(&req.wallet_address);
+        let notes = Self::normalize_optional(&req.notes);
+        let name = req.name.trim();
+        let relationship = req.relationship.trim();
+
+        Self::validate_contact_details(name, relationship, &email, &phone, &wallet_address)?;
+
+        let contact = sqlx::query_as::<_, EmergencyContact>(
+            r#"
+            INSERT INTO emergency_contacts (
+                user_id, name, relationship, email, phone, wallet_address, notes
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, user_id, name, relationship, email, phone, wallet_address, notes,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(user_id)
+        .bind(name)
+        .bind(relationship)
+        .bind(email)
+        .bind(phone)
+        .bind(wallet_address)
+        .bind(notes)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(contact)
+    }
+
+    pub async fn update_contact(
+        pool: &PgPool,
+        user_id: Uuid,
+        contact_id: Uuid,
+        req: &UpdateEmergencyContactRequest,
+    ) -> Result<EmergencyContact, ApiError> {
+        let email = Self::normalize_optional(&req.email);
+        let phone = Self::normalize_optional(&req.phone);
+        let wallet_address = Self::normalize_optional(&req.wallet_address);
+        let notes = Self::normalize_optional(&req.notes);
+        let name = req.name.trim();
+        let relationship = req.relationship.trim();
+
+        Self::validate_contact_details(name, relationship, &email, &phone, &wallet_address)?;
+
+        let updated = sqlx::query_as::<_, EmergencyContact>(
+            r#"
+            UPDATE emergency_contacts
+            SET name = $1,
+                relationship = $2,
+                email = $3,
+                phone = $4,
+                wallet_address = $5,
+                notes = $6,
+                updated_at = NOW()
+            WHERE id = $7 AND user_id = $8
+            RETURNING id, user_id, name, relationship, email, phone, wallet_address, notes,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(name)
+        .bind(relationship)
+        .bind(email)
+        .bind(phone)
+        .bind(wallet_address)
+        .bind(notes)
+        .bind(contact_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+
+        updated.ok_or_else(|| {
+            ApiError::NotFound(format!("Emergency contact {} not found", contact_id))
+        })
+    }
+
+    pub async fn delete_contact(
+        pool: &PgPool,
+        user_id: Uuid,
+        contact_id: Uuid,
+    ) -> Result<EmergencyContactDeleteResponse, ApiError> {
+        let deleted = sqlx::query_scalar::<_, Uuid>(
+            "DELETE FROM emergency_contacts WHERE id = $1 AND user_id = $2 RETURNING id",
+        )
+        .bind(contact_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+
+        match deleted {
+            Some(contact_id) => Ok(EmergencyContactDeleteResponse {
+                success: true,
+                contact_id,
+                message: "Emergency contact deleted successfully".to_string(),
+            }),
+            None => Err(ApiError::NotFound(format!(
+                "Emergency contact {} not found",
+                contact_id
+            ))),
+        }
+    }
+}
+
+pub struct EmergencyAccessService;
+
+struct RiskAlertInput<'a> {
+    grant_id: Uuid,
+    user_id: Uuid,
+    contact_id: Uuid,
+    alert_type: &'a str,
+    severity: &'a str,
+    message: &'a str,
+    metadata: serde_json::Value,
+}
+
+impl EmergencyAccessService {
+    async fn create_risk_alert(
+        pool: &PgPool,
+        executor: &mut sqlx::PgConnection,
+        input: RiskAlertInput<'_>,
+    ) -> Result<(), ApiError> {
+        sqlx::query(
+            r#"
+            INSERT INTO emergency_access_risk_alerts (
+                grant_id, user_id, emergency_contact_id, alert_type, severity, message, metadata
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+        )
+        .bind(input.grant_id)
+        .bind(input.user_id)
+        .bind(input.contact_id)
+        .bind(input.alert_type)
+        .bind(input.severity)
+        .bind(input.message)
+        .bind(input.metadata)
+        .execute(executor)
+        .await?;
+
+        // After persisting the alert, trigger external notifications
+        use crate::alert_provider::MockAlertProvider;
+        use crate::notifications::EmergencyAlertService;
+
+        let provider = MockAlertProvider;
+        if let Err(e) = EmergencyAlertService::send_risk_alert(
+            pool,
+            &provider,
+            input.user_id,
+            input.contact_id,
+            input.alert_type,
+            input.message,
+        )
+        .await
+        {
+            tracing::error!("Failed to send emergency risk alert: {}", e);
+            // We don't return error here to avoid rolling back the risk alert insertion
+            // because the alert itself is already in the DB.
+        }
+
+        Ok(())
+    }
+
+    async fn evaluate_grant_risk(
+        pool: &PgPool,
+        executor: &mut sqlx::PgConnection,
+        grant: &EmergencyAccessGrant,
+    ) -> Result<(), ApiError> {
+        let recent_grant_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM emergency_access_grants
+            WHERE user_id = $1
+              AND created_at >= NOW() - INTERVAL '1 hour'
+            "#,
+        )
+        .bind(grant.user_id)
+        .fetch_one(&mut *executor)
+        .await?;
+
+        if recent_grant_count >= 4 {
+            Self::create_risk_alert(
+                pool,
+                executor,
+                RiskAlertInput {
+                    grant_id: grant.id,
+                    user_id: grant.user_id,
+                    contact_id: grant.emergency_contact_id,
+                    alert_type: "high_frequency_grants",
+                    severity: "high",
+                    message:
+                        "Multiple emergency access grants were created within a short time window.",
+                    metadata: serde_json::json!({ "recent_grant_count": recent_grant_count }),
+                },
+            )
+            .await?;
+        }
+
+        let long_lived_high_privilege = grant.permissions.iter().any(|permission| {
+            permission == "transfer_funds" || permission == "manage_beneficiaries"
+        }) && grant.expires_at
+            >= Utc::now() + chrono::Duration::days(7);
+
+        if long_lived_high_privilege {
+            Self::create_risk_alert(
+                pool,
+                executor,
+                RiskAlertInput {
+                    grant_id: grant.id,
+                    user_id: grant.user_id,
+                    contact_id: grant.emergency_contact_id,
+                    alert_type: "high_privilege_long_lived_access",
+                    severity: "medium",
+                    message: "High-privilege emergency access was granted with a long expiration window.",
+                    metadata: serde_json::json!({
+                        "permissions": grant.permissions,
+                        "expires_at": grant.expires_at
+                    }),
+                },
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn evaluate_revoke_risk(
+        pool: &PgPool,
+        executor: &mut sqlx::PgConnection,
+        grant: &EmergencyAccessGrant,
+    ) -> Result<(), ApiError> {
+        if let Some(revoked_at) = grant.revoked_at {
+            let active_duration = revoked_at - grant.created_at;
+            if active_duration <= chrono::Duration::minutes(10) {
+                Self::create_risk_alert(
+                    pool,
+                    executor,
+                    RiskAlertInput {
+                        grant_id: grant.id,
+                        user_id: grant.user_id,
+                        contact_id: grant.emergency_contact_id,
+                        alert_type: "rapid_grant_revoke",
+                        severity: "medium",
+                        message: "Emergency access was revoked shortly after it was granted.",
+                        metadata: serde_json::json!({
+                            "granted_at": grant.created_at,
+                            "revoked_at": revoked_at,
+                            "active_duration_minutes": active_duration.num_minutes()
+                        }),
+                    },
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn normalize_permissions(permissions: &[String]) -> Vec<String> {
+        permissions
+            .iter()
+            .filter_map(|permission| {
+                let trimmed = permission.trim().to_lowercase();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            })
+            .collect()
+    }
+
+    fn validate_grant_input(
+        permissions: &[String],
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), ApiError> {
+        if permissions.is_empty() {
+            return Err(ApiError::BadRequest(
+                "permissions must contain at least one emergency access capability".to_string(),
+            ));
+        }
+
+        if expires_at <= Utc::now() {
+            return Err(ApiError::BadRequest(
+                "expires_at must be set to a future time".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn assert_contact_belongs_to_user(
+        executor: impl sqlx::PgExecutor<'_>,
+        user_id: Uuid,
+        contact_id: Uuid,
+    ) -> Result<(), ApiError> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM emergency_contacts
+                WHERE id = $1 AND user_id = $2
+            )
+            "#,
+        )
+        .bind(contact_id)
+        .bind(user_id)
+        .fetch_one(executor)
+        .await?;
+
+        if exists {
+            Ok(())
+        } else {
+            Err(ApiError::NotFound(format!(
+                "Emergency contact {} not found",
+                contact_id
+            )))
+        }
+    }
+
+    async fn log_action(
+        executor: impl sqlx::PgExecutor<'_>,
+        grant_id: Uuid,
+        user_id: Uuid,
+        contact_id: Uuid,
+        action: &str,
+        metadata: serde_json::Value,
+    ) -> Result<(), ApiError> {
+        sqlx::query(
+            r#"
+            INSERT INTO emergency_access_audit_logs (
+                grant_id, user_id, emergency_contact_id, action, metadata
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(grant_id)
+        .bind(user_id)
+        .bind(contact_id)
+        .bind(action)
+        .bind(metadata)
+        .execute(executor)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn grant_access(
+        pool: &PgPool,
+        user_id: Uuid,
+        req: &CreateEmergencyAccessGrantRequest,
+    ) -> Result<EmergencyAccessActionResponse, ApiError> {
+        let permissions = Self::normalize_permissions(&req.permissions);
+        Self::validate_grant_input(&permissions, req.expires_at)?;
+
+        let mut tx = pool.begin().await?;
+        Self::assert_contact_belongs_to_user(&mut *tx, user_id, req.emergency_contact_id).await?;
+
+        let grant = sqlx::query_as::<_, EmergencyAccessGrant>(
+            r#"
+            INSERT INTO emergency_access_grants (
+                user_id, emergency_contact_id, permissions, expires_at
+            )
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, user_id, emergency_contact_id, permissions, expires_at, is_active,
+                      revoked_at, created_at, updated_at
+            "#,
+        )
+        .bind(user_id)
+        .bind(req.emergency_contact_id)
+        .bind(&permissions)
+        .bind(req.expires_at)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        Self::log_action(
+            &mut *tx,
+            grant.id,
+            user_id,
+            grant.emergency_contact_id,
+            audit_action::EMERGENCY_ACCESS_GRANTED,
+            serde_json::json!({
+                "permissions": grant.permissions,
+                "expires_at": grant.expires_at
+            }),
+        )
+        .await?;
+
+        AuditLogService::log(
+            &mut *tx,
+            Some(user_id),
+            None,
+            audit_action::EMERGENCY_ACCESS_GRANTED,
+            Some(grant.id),
+            Some(entity_type::USER),
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        Self::evaluate_grant_risk(pool, &mut tx, &grant).await?;
+
+        tx.commit().await?;
+
+        Ok(EmergencyAccessActionResponse {
+            success: true,
+            grant,
+            message: "Emergency access granted successfully".to_string(),
+        })
+    }
+
+    pub async fn revoke_access(
+        pool: &PgPool,
+        user_id: Uuid,
+        grant_id: Uuid,
+        req: &RevokeEmergencyAccessGrantRequest,
+    ) -> Result<EmergencyAccessActionResponse, ApiError> {
+        let reason = req.reason.as_ref().and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        let mut tx = pool.begin().await?;
+
+        let grant = sqlx::query_as::<_, EmergencyAccessGrant>(
+            r#"
+            SELECT id, user_id, emergency_contact_id, permissions, expires_at, is_active,
+                   revoked_at, created_at, updated_at
+            FROM emergency_access_grants
+            WHERE id = $1 AND user_id = $2
+            "#,
+        )
+        .bind(grant_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Emergency access grant {} not found", grant_id))
+        })?;
+
+        if !grant.is_active {
+            return Err(ApiError::BadRequest(
+                "Emergency access grant is already inactive".to_string(),
+            ));
+        }
+
+        let updated = sqlx::query_as::<_, EmergencyAccessGrant>(
+            r#"
+            UPDATE emergency_access_grants
+            SET is_active = false,
+                revoked_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, user_id, emergency_contact_id, permissions, expires_at, is_active,
+                      revoked_at, created_at, updated_at
+            "#,
+        )
+        .bind(grant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        Self::log_action(
+            &mut *tx,
+            updated.id,
+            user_id,
+            updated.emergency_contact_id,
+            audit_action::EMERGENCY_ACCESS_REVOKED,
+            serde_json::json!({
+                "reason": reason,
+                "revoked_at": updated.revoked_at
+            }),
+        )
+        .await?;
+
+        AuditLogService::log(
+            &mut *tx,
+            Some(user_id),
+            None,
+            audit_action::EMERGENCY_ACCESS_REVOKED,
+            Some(updated.id),
+            Some(entity_type::USER),
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        Self::evaluate_revoke_risk(pool, &mut tx, &updated).await?;
+
+        // Auto-end all active sessions for this grant (Issue #306)
+        EmergencySessionService::end_sessions_for_grant(&mut *tx, updated.id).await?;
+
+        tx.commit().await?;
+
+        Ok(EmergencyAccessActionResponse {
+            success: true,
+            grant: updated,
+            message: "Emergency access revoked successfully".to_string(),
+        })
+    }
+
+    pub async fn list_audit_logs(
+        pool: &PgPool,
+        user_id: Uuid,
+        filters: &EmergencyAccessAuditLogFilters,
+    ) -> Result<Vec<EmergencyAccessAuditLog>, ApiError> {
+        let limit = filters.limit.unwrap_or(50).min(100) as i64;
+
+        let mut query = QueryBuilder::<Postgres>::new(
+            "SELECT id, grant_id, user_id, emergency_contact_id, action, metadata, created_at \
+             FROM emergency_access_audit_logs WHERE user_id = ",
+        );
+        query.push_bind(user_id);
+
+        if let Some(action) = filters
+            .action
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            query.push(" AND action = ");
+            query.push_bind(action);
+        }
+
+        if let Some(grant_id) = filters.grant_id {
+            query.push(" AND grant_id = ");
+            query.push_bind(grant_id);
+        }
+
+        if let Some(emergency_contact_id) = filters.emergency_contact_id {
+            query.push(" AND emergency_contact_id = ");
+            query.push_bind(emergency_contact_id);
+        }
+
+        query.push(" ORDER BY created_at DESC LIMIT ");
+        query.push_bind(limit);
+
+        let logs = query
+            .build_query_as::<EmergencyAccessAuditLog>()
+            .fetch_all(pool)
+            .await?;
+
+        Ok(logs)
+    }
+
+    pub async fn list_risk_alerts(
+        pool: &PgPool,
+        user_id: Uuid,
+    ) -> Result<Vec<EmergencyAccessRiskAlert>, ApiError> {
+        let alerts = sqlx::query_as::<_, EmergencyAccessRiskAlert>(
+            r#"
+            SELECT id, grant_id, user_id, emergency_contact_id, alert_type, severity, message,
+                   metadata, created_at
+            FROM emergency_access_risk_alerts
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(alerts)
+    }
+
+    pub async fn get_dashboard(
+        pool: &PgPool,
+        user_id: Uuid,
+    ) -> Result<EmergencyAccessDashboardResponse, ApiError> {
+        #[derive(sqlx::FromRow)]
+        struct DashboardRow {
+            grant_id: Uuid,
+            emergency_contact_id: Uuid,
+            contact_name: String,
+            is_active: bool,
+            expires_at: DateTime<Utc>,
+            permissions: Vec<String>,
+        }
+
+        let rows = sqlx::query_as::<_, DashboardRow>(
+            r#"
+            SELECT g.id AS grant_id,
+                   g.emergency_contact_id,
+                   c.name AS contact_name,
+                   g.is_active,
+                   g.expires_at,
+                   g.permissions
+            FROM emergency_access_grants g
+            INNER JOIN emergency_contacts c ON c.id = g.emergency_contact_id
+            WHERE g.user_id = $1
+            ORDER BY g.created_at DESC
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+
+        let now = Utc::now();
+        let grants = rows
+            .into_iter()
+            .map(|row| {
+                let active_access = row.is_active && row.expires_at > now;
+                let status = if active_access {
+                    "active"
+                } else if row.is_active {
+                    "expired"
+                } else {
+                    "revoked"
+                };
+
+                EmergencyAccessDashboardItem {
+                    grant_id: row.grant_id,
+                    emergency_contact_id: row.emergency_contact_id,
+                    contact_name: row.contact_name,
+                    status: status.to_string(),
+                    active_access,
+                    permissions: row.permissions,
+                    expires_at: row.expires_at,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let active_access_count = grants.iter().filter(|grant| grant.active_access).count();
+
+        Ok(EmergencyAccessDashboardResponse {
+            active_access_count,
+            grants,
+        })
+    }
 }
 
 pub struct EmergencyAdminService;
@@ -2723,8 +3752,8 @@ impl EmergencyAdminService {
         let rows = sqlx::query_as::<_, PlanRowFull>(
             r#"
             SELECT id, user_id, title, description, fee, net_amount, status,
-                   contract_plan_id, distribution_method, is_active, contract_created_at,
-                   beneficiary_name, bank_account_number, bank_name, currency_preference,
+                   contract_plan_id, distribution_method, is_active, is_paused, risk_override_enabled,
+                   contract_created_at, beneficiary_name, bank_account_number, bank_name, currency_preference,
                    created_at, updated_at
             FROM plans
             WHERE is_paused = true
@@ -2744,8 +3773,8 @@ impl EmergencyAdminService {
         let rows = sqlx::query_as::<_, PlanRowFull>(
             r#"
             SELECT id, user_id, title, description, fee, net_amount, status,
-                   contract_plan_id, distribution_method, is_active, contract_created_at,
-                   beneficiary_name, bank_account_number, bank_name, currency_preference,
+                   contract_plan_id, distribution_method, is_active, is_paused, risk_override_enabled,
+                   contract_created_at, beneficiary_name, bank_account_number, bank_name, currency_preference,
                    created_at, updated_at
             FROM plans
             WHERE risk_override_enabled = true
@@ -2756,5 +3785,249 @@ impl EmergencyAdminService {
         .await?;
 
         rows.iter().map(plan_row_to_plan_with_beneficiary).collect()
+    }
+}
+
+// ─── Emergency Session Service (Issue #306) ─────────────────────────────────
+
+pub struct EmergencySessionService;
+
+impl EmergencySessionService {
+    /// Start a new session for an active grant.
+    pub async fn start_session(
+        pool: &PgPool,
+        user_id: Uuid,
+        req: &StartSessionRequest,
+    ) -> Result<EmergencyAccessSession, ApiError> {
+        // Verify the grant exists, belongs to user, and is active
+        let grant = sqlx::query_as::<_, EmergencyAccessGrant>(
+            r#"
+            SELECT id, user_id, emergency_contact_id, permissions, expires_at, is_active,
+                   revoked_at, created_at, updated_at
+            FROM emergency_access_grants
+            WHERE id = $1 AND user_id = $2
+            "#,
+        )
+        .bind(req.grant_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("Emergency access grant {} not found", req.grant_id))
+        })?;
+
+        if !grant.is_active {
+            return Err(ApiError::BadRequest(
+                "Cannot start session for an inactive grant".to_string(),
+            ));
+        }
+
+        if grant.expires_at <= Utc::now() {
+            return Err(ApiError::BadRequest(
+                "Cannot start session for an expired grant".to_string(),
+            ));
+        }
+
+        let session = sqlx::query_as::<_, EmergencyAccessSession>(
+            r#"
+            INSERT INTO emergency_access_sessions (
+                grant_id, user_id, emergency_contact_id, ip_address, user_agent
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, grant_id, user_id, emergency_contact_id, started_at,
+                      last_active_at, ended_at, ip_address, user_agent, created_at
+            "#,
+        )
+        .bind(req.grant_id)
+        .bind(user_id)
+        .bind(grant.emergency_contact_id)
+        .bind(&req.ip_address)
+        .bind(&req.user_agent)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(session)
+    }
+
+    /// Update the heartbeat timestamp for an active session.
+    pub async fn heartbeat(
+        pool: &PgPool,
+        user_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<EmergencyAccessSession, ApiError> {
+        let session = sqlx::query_as::<_, EmergencyAccessSession>(
+            r#"
+            UPDATE emergency_access_sessions
+            SET last_active_at = NOW()
+            WHERE id = $1 AND user_id = $2 AND ended_at IS NULL
+            RETURNING id, grant_id, user_id, emergency_contact_id, started_at,
+                      last_active_at, ended_at, ip_address, user_agent, created_at
+            "#,
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Active session {} not found", session_id)))?;
+
+        Ok(session)
+    }
+
+    /// End an active session.
+    pub async fn end_session(
+        pool: &PgPool,
+        user_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<EmergencyAccessSession, ApiError> {
+        let session = sqlx::query_as::<_, EmergencyAccessSession>(
+            r#"
+            UPDATE emergency_access_sessions
+            SET ended_at = NOW(), last_active_at = NOW()
+            WHERE id = $1 AND user_id = $2 AND ended_at IS NULL
+            RETURNING id, grant_id, user_id, emergency_contact_id, started_at,
+                      last_active_at, ended_at, ip_address, user_agent, created_at
+            "#,
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Active session {} not found", session_id)))?;
+
+        Ok(session)
+    }
+
+    /// List all active sessions for a user.
+    pub async fn list_active_sessions(
+        pool: &PgPool,
+        user_id: Uuid,
+    ) -> Result<Vec<EmergencyAccessSession>, ApiError> {
+        let sessions = sqlx::query_as::<_, EmergencyAccessSession>(
+            r#"
+            SELECT id, grant_id, user_id, emergency_contact_id, started_at,
+                   last_active_at, ended_at, ip_address, user_agent, created_at
+            FROM emergency_access_sessions
+            WHERE user_id = $1 AND ended_at IS NULL
+            ORDER BY started_at DESC
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(sessions)
+    }
+
+    /// End all active sessions for a specific grant (used during revocation).
+    pub async fn end_sessions_for_grant(
+        executor: impl sqlx::PgExecutor<'_>,
+        grant_id: Uuid,
+    ) -> Result<(), ApiError> {
+        sqlx::query(
+            r#"
+            UPDATE emergency_access_sessions
+            SET ended_at = NOW(), last_active_at = NOW()
+            WHERE grant_id = $1 AND ended_at IS NULL
+            "#,
+        )
+        .bind(grant_id)
+        .execute(executor)
+        .await?;
+
+        Ok(())
+    }
+}
+
+// ── Emergency Access Analytics (Issue #306) ─────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmergencyAccessMetric {
+    pub date: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmergencyAccessMetrics {
+    pub total_grants: i64,
+    pub active_grants: i64,
+    pub total_revocations: i64,
+    pub total_alerts: i64,
+    pub alerts_by_severity: BTreeMap<String, i64>,
+    pub grant_trend: Vec<EmergencyAccessMetric>,
+}
+
+pub struct EmergencyAccessMetricsService;
+
+impl EmergencyAccessMetricsService {
+    pub async fn get_metrics(db: &PgPool, range: &str) -> Result<EmergencyAccessMetrics, ApiError> {
+        let total_grants: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM emergency_access_grants")
+            .fetch_one(db)
+            .await?;
+
+        let active_grants: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM emergency_access_grants WHERE is_active = true AND expires_at > NOW()",
+        )
+        .fetch_one(db)
+        .await?;
+
+        let total_revocations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM emergency_access_grants WHERE revoked_at IS NOT NULL",
+        )
+        .fetch_one(db)
+        .await?;
+
+        let total_alerts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM emergency_access_risk_alerts")
+                .fetch_one(db)
+                .await?;
+
+        let alert_severity_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT severity, COUNT(*) FROM emergency_access_risk_alerts GROUP BY severity",
+        )
+        .fetch_all(db)
+        .await?;
+
+        let mut alerts_by_severity = BTreeMap::new();
+        for (severity, count) in alert_severity_rows {
+            alerts_by_severity.insert(severity.to_lowercase(), count);
+        }
+
+        let (interval, trunc) = match range {
+            "daily" => ("30 days", "day"),
+            "weekly" => ("12 weeks", "week"),
+            "monthly" => ("12 months", "month"),
+            _ => ("30 days", "day"), // default to daily
+        };
+
+        let trend_query = format!(
+            r#"
+            SELECT 
+                DATE_TRUNC('{}', created_at)::DATE::TEXT as date,
+                COUNT(*)::BIGINT as count
+            FROM emergency_access_grants
+            WHERE created_at >= NOW() - INTERVAL '{}'
+            GROUP BY 1
+            ORDER BY 1
+            "#,
+            trunc, interval
+        );
+
+        let trend_rows: Vec<(String, i64)> = sqlx::query_as(&trend_query).fetch_all(db).await?;
+
+        let grant_trend = trend_rows
+            .into_iter()
+            .map(|(date, count)| EmergencyAccessMetric { date, count })
+            .collect();
+
+        Ok(EmergencyAccessMetrics {
+            total_grants,
+            active_grants,
+            total_revocations,
+            total_alerts,
+            alerts_by_severity,
+            grant_trend,
+        })
     }
 }
