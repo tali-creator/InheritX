@@ -63,7 +63,7 @@ impl TestContext {
         let expires_at = chrono::Utc::now() + chrono::Duration::minutes(5);
 
         sqlx::query(
-            "INSERT INTO user_2fa (user_id, otp_hash, expires_at) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET otp_hash = $2, expires_at = $3"
+            "INSERT INTO user_2fa (user_id, otp_hash, expires_at) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET otp_hash = $2, expires_at = $3",
         )
         .bind(user_id)
         .bind(otp_hash)
